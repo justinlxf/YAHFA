@@ -1,7 +1,5 @@
 #include <jni.h>
-#include <sys/mman.h>
 #include <stdlib.h>
-#include <dlfcn.h>
 
 #include "common.h"
 #include "trampoline.h"
@@ -16,26 +14,6 @@ static uint32_t kAccCompileDontBother = 0x01000000;
 static uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000;
 
 static jfieldID fieldArtMethod = NULL;
-
-static inline uint32_t read32(void *addr) {
-    return *((uint32_t *) addr);
-}
-
-static inline void write32(void *addr, uint32_t value) {
-    *((uint32_t *) addr) = value;
-}
-
-static inline void *readAddr(void *addr) {
-    return *((void **) addr);
-}
-
-static inline void writeAddr(void *addr, void *value) {
-    *((void **)addr) = value;
-}
-
-#ifndef __ANDROID_API_R__
-#define __ANDROID_API_R__ 30
-#endif
 
 void Java_lab_galaxy_yahfa_HookMain_init(JNIEnv *env, jclass clazz, jint sdkVersion) {
     SDKVersion = sdkVersion;
@@ -119,15 +97,6 @@ static void setNonCompilable(void *method) {
 }
 
 static int replaceMethod(void *fromMethod, void *toMethod, int isBackup) {
-    if (hookCount >= hookCap) {
-        LOGI("not enough capacity. Allocating...");
-        if (doInitHookCap(DEFAULT_CAP)) {
-            LOGE("cannot hook method");
-            return 1;
-        }
-        LOGI("Allocating done");
-    }
-
     LOGI("replace method from %p to %p", fromMethod, toMethod);
 
     // replace entry point
@@ -168,16 +137,17 @@ static int replaceMethod(void *fromMethod, void *toMethod, int isBackup) {
             // On API 29 whether to use the fast path or not is cached in the ART method structure
             access_flags &= ~kAccFastInterpreterToInterpreterInvoke;
         }
-        if (SDKVersion <= __ANDROID_API_Q__) {
+        // MakeInitializedClassesVisiblyInitialized is called explicitly
+        // entry of jni methods would not be set to jni trampoline after hooked
+//        if (SDKVersion <= __ANDROID_API_Q__) {
             // We don't set kAccNative on R+ because they will try to load from real native method pointer instead of entry_point_from_quick_compiled_code_.
             // Ref: https://cs.android.com/android/platform/superproject/+/android-11.0.0_r3:art/runtime/art_method.h;l=844;bpv=1;bpt=1
             access_flags |= kAccNative;
-        }
+//        }
         setFlags(fromMethod, access_flags);
         LOGI("change access flags from 0x%x to 0x%x", old_flags, access_flags);
     }
 
-    hookCount += 1;
     return 0;
 
 }

@@ -4,17 +4,15 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "trampoline.h"
 
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
+static unsigned char *currentTrampolineOff = 0;
+static unsigned char *trampolineSpaceEnd = 0;
 
-static unsigned char *trampolineCode; // place where trampolines are saved
-static unsigned int trampolineSize; // trampoline size required for each hook
-
-unsigned int hookCap = 0;
-unsigned int hookCount = 0;
+static void *allocTrampolineSpace();
 
 // trampoline:
 // 1. set eax/rdi/r0/x0 to the hook ArtMethod addr
@@ -29,6 +27,7 @@ unsigned int hookCount = 0;
 // ff 70 20 ; push DWORD PTR [eax + 0x20]
 // c3 ; ret
 unsigned char trampoline[] = {
+        0x00, 0x00, 0x00, 0x00, // code_size_ in OatQuickMethodHeader
         0xb8, 0x78, 0x56, 0x34, 0x12,
         0xff, 0x70, 0x20,
         0xc3
@@ -48,6 +47,7 @@ unsigned char trampolineForBackup[] = {
 // ff 77 20 ; push QWORD PTR [rdi + 0x20]
 // c3 ; ret
 unsigned char trampoline[] = {
+    0x00, 0x00, 0x00, 0x00, // code_size_ in OatQuickMethodHeader
     0x48, 0xbf, 0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12,
     0xff, 0x77, 0x20,
     0xc3
@@ -69,6 +69,7 @@ unsigned char trampolineForBackup[] = {
 // 20 F0 90 E5 ; ldr pc, [r0, 0x20]
 // 78 56 34 12 ; 0x12345678 (addr of the hook method)
 unsigned char trampoline[] = {
+        0x00, 0x00, 0x00, 0x00, // code_size_ in OatQuickMethodHeader
         0x00, 0x00, 0x9f, 0xe5,
         0x20, 0xf0, 0x90, 0xe5,
         0x78, 0x56, 0x34, 0x12
@@ -96,6 +97,7 @@ unsigned char trampolineForBackup[] = {
 // 78 56 34 12
 // 89 67 45 23 ; 0x2345678912345678 (addr of the hook method)
 unsigned char trampoline[] = {
+        0x00, 0x00, 0x00, 0x00, // code_size_ in OatQuickMethodHeader
         0x60, 0x00, 0x00, 0x58,
         0x10, 0x00, 0x40, 0xf8,
         0x00, 0x02, 0x1f, 0xd6,
@@ -120,10 +122,21 @@ unsigned char trampolineForBackup[] = {
         0x89, 0x67, 0x45, 0x23
 };
 #endif
-static unsigned int trampolineSize = roundUpToPtrSize(MAX(sizeof(trampoline), sizeof(trampolineForBackup)));
 
 void *genTrampoline(void *toMethod, void *entrypoint) {
-    unsigned char *targetAddr = trampolineCode + trampolineSize * hookCount;
+    size_t trampolineSize = entrypoint != NULL ? sizeof(trampolineForBackup) : sizeof(trampoline);
+
+    // check available space for new trampoline
+    if(currentTrampolineOff+trampolineSize > trampolineSpaceEnd) {
+        currentTrampolineOff = allocTrampolineSpace();
+        if (currentTrampolineOff == NULL) {
+            return NULL;
+        } else {
+            trampolineSpaceEnd = currentTrampolineOff + TRAMPOLINE_SPACE_SIZE;
+        }
+    }
+
+    unsigned char *targetAddr = currentTrampolineOff;
 
     if(entrypoint != NULL) {
         memcpy(targetAddr, trampolineForBackup, sizeof(trampolineForBackup));
@@ -140,7 +153,7 @@ void *genTrampoline(void *toMethod, void *entrypoint) {
         memcpy(targetAddr + 6, &entrypoint, pointer_size);
     }
     else {
-        memcpy(targetAddr + 1, &toMethod, pointer_size);
+        memcpy(targetAddr + 5, &toMethod, pointer_size);
     }
 
 #elif defined(__x86_64__)
@@ -149,7 +162,7 @@ void *genTrampoline(void *toMethod, void *entrypoint) {
         memcpy(targetAddr + 13, &toMethod, pointer_size);
     }
     else {
-        memcpy(targetAddr + 2, &toMethod, pointer_size);
+        memcpy(targetAddr + 6, &toMethod, pointer_size);
     }
 
 #elif defined(__arm__)
@@ -158,7 +171,7 @@ void *genTrampoline(void *toMethod, void *entrypoint) {
         memcpy(targetAddr + 16, &toMethod, pointer_size);
     }
     else {
-        memcpy(targetAddr + 8, &toMethod, pointer_size);
+        memcpy(targetAddr + 12, &toMethod, pointer_size);
     }
 
 #elif defined(__aarch64__)
@@ -167,48 +180,48 @@ void *genTrampoline(void *toMethod, void *entrypoint) {
         memcpy(targetAddr + 12, &toMethod, pointer_size);
     }
     else {
-        memcpy(targetAddr + 12, &toMethod, pointer_size);
+        memcpy(targetAddr + 16, &toMethod, pointer_size);
     }
-
 #else
 #error Unsupported architecture
 #endif
+
+    // skip 4 bytes of code_size_
+    if(entrypoint == NULL) {
+        targetAddr += 4;
+    }
+
+    // keep each trampoline aligned
+    currentTrampolineOff += roundUpToPtrSize(trampolineSize);
 
     return targetAddr;
 }
 
 void setupTrampoline(uint8_t offset) {
 #if defined(__i386__)
-    trampoline[7] = offset;
+    trampoline[11] = offset;
 #elif defined(__x86_64__)
-    trampoline[12] = offset;
+    trampoline[16] = offset;
 #elif defined(__arm__)
-    trampoline[4] = offset;
+    trampoline[8] = offset;
 #elif defined(__aarch64__)
-    trampoline[5] |= offset << 4;
-    trampoline[6] |= offset >> 4;
+    trampoline[9] |= offset << 4;
+    trampoline[10] |= offset >> 4;
 #else
 #error Unsupported architecture
 #endif
 }
 
-int doInitHookCap(unsigned int cap) {
-    if (cap == 0) {
-        LOGE("invalid capacity: %d", cap);
-        return 1;
-    }
-    if (hookCap) {
-        LOGW("allocating new space for trampoline code");
-    }
-    unsigned int allSize = trampolineSize * cap;
-    unsigned char *buf = mmap(NULL, allSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+static void *allocTrampolineSpace() {
+    unsigned char *buf = mmap(NULL, TRAMPOLINE_SPACE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
                               MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (buf == MAP_FAILED) {
         LOGE("mmap failed, errno = %s", strerror(errno));
-        return 1;
+        return NULL;
     }
-    hookCap = cap;
-    hookCount = 0;
-    trampolineCode = buf;
-    return 0;
+    else {
+        LOGI("allocating space for trampoline code at %p", buf);
+        return buf;
+    }
+
 }
